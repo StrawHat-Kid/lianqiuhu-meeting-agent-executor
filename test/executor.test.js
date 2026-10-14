@@ -109,6 +109,66 @@ async function requestHealth(port) {
   });
 }
 
+async function requestJson(port, method, path, payload) {
+  const body = payload === undefined ? null : JSON.stringify(payload);
+  return new Promise((resolve, reject) => {
+    const headers = body === null ? {} : { 'Content-Type': 'application/json' };
+    const request = http.request({ host: '127.0.0.1', port, method, path, headers }, (response) => {
+      response.setEncoding('utf8');
+      let responseBody = '';
+      response.on('data', (chunk) => { responseBody += chunk; });
+      response.on('end', () => resolve({ statusCode: response.statusCode, body: JSON.parse(responseBody) }));
+    });
+    request.on('error', reject);
+    if (body !== null) request.write(body);
+    request.end();
+  });
+}
+
+async function requestRaw(port, method, path, text) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({ host: '127.0.0.1', port, method, path, headers: { 'Content-Type': 'application/json' } }, (response) => {
+      response.setEncoding('utf8');
+      let responseBody = '';
+      response.on('data', (chunk) => { responseBody += chunk; });
+      response.on('end', () => resolve({ statusCode: response.statusCode, body: JSON.parse(responseBody) }));
+    });
+    request.on('error', reject);
+    request.write(text);
+    request.end();
+  });
+}
+
+async function waitFor(predicate, timeoutMs = 1000) {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) throw new Error('waitFor timeout');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function createControllableRunner() {
+  let resolveRun;
+  let resolveStopped;
+
+  const runner = {
+    started: 0,
+    stopped: 0,
+    stoppedPromise: new Promise((resolve) => { resolveStopped = resolve; }),
+    run() {
+      this.started += 1;
+      return new Promise((resolve) => { resolveRun = resolve; });
+    },
+    stop() {
+      this.stopped += 1;
+      resolveStopped();
+      resolveRun();
+    }
+  };
+
+  return runner;
+}
+
 test('配置读取 PORT=18035，AGENT 缺失时 HTTP Server 和 Runner 均不启动', async () => {
   const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
   assert.deepEqual(readConfig(baseEnv), {
@@ -255,16 +315,370 @@ test('HTTP 服务实际监听配置 PORT=18035，GET /health 返回 200，且 AG
   try {
     assert.equal(running.server.address().port, port);
     assert.equal(running.config.agent, TEST_AGENT);
-    assert.equal(runnerOptions.agent, TEST_AGENT);
-    assert.equal(runnerOptions.to, TO);
+    assert.equal(runnerOptions, undefined);
     assert.deepEqual(
       { ingressHost: clientOptions.ingressHost, ingressPort: clientOptions.ingressPort, authToken: clientOptions.authToken, timeoutMs: clientOptions.timeoutMs, ingressUrl: clientOptions.ingressUrl },
       { ingressHost: '127.0.0.1', ingressPort: 29876, authToken: 'test-token', timeoutMs: 1000, ingressUrl: 'http://127.0.0.1:29876/agent/send' }
     );
     assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
+    await running.controller.start();
+    assert.equal(runnerOptions.agent, TEST_AGENT);
+    assert.equal(runnerOptions.to, TO);
   } finally {
     await running.shutdown('test');
   }
+});
+
+test('启动后仅监听 HTTP 服务，不自动创建 Polling Runner', async () => {
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const runners = [];
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => ({}),
+    createPollingRunnerFn: () => { const runner = createControllableRunner(); runners.push(runner); return runner; }
+  });
+
+  try {
+    assert.equal(runners.length, 0);
+    assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
+  } finally {
+    await running.shutdown('test');
+  }
+});
+
+test('执行器启动后不自动发起任何 RUISI 回程请求', async () => {
+  const requests = [];
+  const mock = await mockIngress(async (request, response) => {
+    requests.push(await readJson(request));
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end('{"status":"ok"}');
+  });
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => createRuisiClient({ ingressUrl: mock.url, authToken: 'test-token', timeoutMs: 1000 })
+  });
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(requests.length, 0);
+    assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
+  } finally {
+    await running.shutdown('test');
+    await mock.close();
+  }
+});
+
+test('POST /api/commands 启动指令开启轮询且重复调用只创建一个 Runner', async () => {
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const runners = [];
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => ({}),
+    createPollingRunnerFn: () => { const runner = createControllableRunner(); runners.push(runner); return runner; }
+  });
+
+  try {
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI会议智能体', params: {} }]), {
+      statusCode: 200,
+      body: { ok: true, message: 'polling started' }
+    });
+    assert.equal(runners.length, 1);
+    assert.equal(runners[0].started, 1);
+
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI会议智能体', params: {} }]), {
+      statusCode: 200,
+      body: { ok: true, message: 'polling already running' }
+    });
+    assert.equal(runners.length, 1);
+    assert.equal(runners[0].started, 1);
+  } finally {
+    await running.shutdown('test');
+  }
+});
+
+test('POST /api/commands 取消指令停止后 HTTP 保持可用，再次启动创建新 Runner', async () => {
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const runners = [];
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => ({}),
+    createPollingRunnerFn: () => { const runner = createControllableRunner(); runners.push(runner); return runner; }
+  });
+
+  try {
+    await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI会议智能体', params: {} }]);
+
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '取消园区AI会议智能体', params: {} }]), {
+      statusCode: 200,
+      body: { ok: true, message: 'polling stopped' }
+    });
+    assert.equal(runners[0].stopped, 1);
+
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '取消园区AI会议智能体', params: {} }]), {
+      statusCode: 200,
+      body: { ok: true, message: 'polling already stopped' }
+    });
+    assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
+
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI会议智能体', params: {} }]), {
+      statusCode: 200,
+      body: { ok: true, message: 'polling started' }
+    });
+    assert.equal(runners.length, 2);
+    assert.equal(runners[1].started, 1);
+  } finally {
+    await running.shutdown('test');
+  }
+});
+
+test('空脚本时指令接口开启与关闭均正常且不发送任何消息', async () => {
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  let sendCount = 0;
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => ({ sendMessage: async () => { sendCount += 1; return { ok: true, status: 200 }; } }),
+    scriptDefinition: EMPTY_SCRIPT
+  });
+
+  try {
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI会议智能体', params: {} }]), {
+      statusCode: 200,
+      body: { ok: true, message: 'polling started' }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(sendCount, 0);
+
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '取消园区AI会议智能体', params: {} }]), {
+      statusCode: 200,
+      body: { ok: true, message: 'polling stopped' }
+    });
+    assert.equal(sendCount, 0);
+  } finally {
+    await running.shutdown('test');
+  }
+});
+
+test('取消指令停止后不再产生新的回程请求，且在途请求先完成', async () => {
+  const requests = [];
+  let releaseResponse = null;
+  const mock = await mockIngress(async (request, response) => {
+    requests.push(await readJson(request));
+    releaseResponse = () => {
+      response.writeHead(200, { 'Content-Type': 'application/json' }).end('{"status":"ok"}');
+    };
+  });
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => createRuisiClient({ ingressUrl: mock.url, authToken: 'test-token', timeoutMs: 1000 }),
+    createPollingRunnerFn: (options) => new PollingRunner({
+      ...options,
+      script: { initialDelayMs: 0, defaultMessageIntervalMs: 40000, paragraphIntervalMs: 720000, paragraphs: [{ id: '01', messages: ['one', 'two', 'three'] }] },
+      sleep: async () => {}
+    })
+  });
+
+  try {
+    await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI会议智能体', params: {} }]);
+    await waitFor(() => requests.length === 1);
+
+    const stopRequest = requestJson(port, 'POST', '/api/commands', [{ action: '取消园区AI会议智能体', params: {} }]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(requests.length, 1);
+
+    releaseResponse();
+    assert.deepEqual(await stopRequest, {
+      statusCode: 200,
+      body: { ok: true, message: 'polling stopped' }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(requests.length, 1);
+    assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
+  } finally {
+    await running.shutdown('test');
+    await mock.close();
+  }
+});
+
+test('未知 action 不会误启动或误停止轮询', async () => {
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const runners = [];
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => ({}),
+    createPollingRunnerFn: () => { const runner = createControllableRunner(); runners.push(runner); return runner; }
+  });
+
+  try {
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI不存在的智能体', params: {} }]), {
+      statusCode: 400,
+      body: { ok: false, error: 'command at index 0 action is not registered' }
+    });
+    assert.equal(runners.length, 0);
+
+    await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI会议智能体', params: {} }]);
+    assert.equal(runners.length, 1);
+
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [
+      { action: '启动园区AI会议智能体', params: {} },
+      { action: '停止轮询', params: {} }
+    ]), {
+      statusCode: 400,
+      body: { ok: false, error: 'command at index 1 action is not registered' }
+    });
+    assert.equal(runners.length, 1);
+    assert.equal(runners[0].stopped, 0);
+    assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
+  } finally {
+    await running.shutdown('test');
+  }
+});
+
+test('异常请求返回合理错误且不改变轮询状态', async () => {
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const runners = [];
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => ({}),
+    createPollingRunnerFn: () => { const runner = createControllableRunner(); runners.push(runner); return runner; }
+  });
+
+  try {
+    assert.deepEqual(await requestRaw(port, 'POST', '/api/commands', 'not-json'), {
+      statusCode: 400, body: { ok: false, error: 'invalid JSON request body' }
+    });
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', []), {
+      statusCode: 400, body: { ok: false, error: 'request body must not be empty' }
+    });
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', { action: '启动园区AI会议智能体' }), {
+      statusCode: 400, body: { ok: false, error: 'request body must be an array or context envelope' }
+    });
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{}]), {
+      statusCode: 400, body: { ok: false, error: 'command at index 0 must include a non-empty string action' }
+    });
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', [{ action: '启动园区AI会议智能体', params: [] }]), {
+      statusCode: 400, body: { ok: false, error: 'command at index 0 params must be a plain object' }
+    });
+    assert.deepEqual(await requestJson(port, 'GET', '/api/commands'), {
+      statusCode: 405, body: { ok: false, error: 'method not allowed' }
+    });
+    assert.deepEqual(await requestJson(port, 'GET', '/api/unknown'), {
+      statusCode: 404, body: { status: 'not_found' }
+    });
+    assert.equal(runners.length, 0);
+  } finally {
+    await running.shutdown('test');
+  }
+});
+
+test('兼容 context 信封请求体', async () => {
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => ({}),
+    createPollingRunnerFn: () => createControllableRunner()
+  });
+
+  try {
+    assert.deepEqual(await requestJson(port, 'POST', '/api/commands', {
+      context: { agent: 'hc-agent' },
+      commands: [{ action: '取消园区AI会议智能体', params: {} }]
+    }), {
+      statusCode: 200, body: { ok: true, message: 'polling already stopped' }
+    });
+  } finally {
+    await running.shutdown('test');
+  }
+});
+
+test('stop({ abortInFlight: false }) 等待在途请求完成且不再发送后续消息', async () => {
+  let resolveSend;
+  let sendCount = 0;
+  const client = {
+    sendMessage: () => {
+      sendCount += 1;
+      return new Promise((resolve) => { resolveSend = () => resolve({ ok: true, status: 200 }); });
+    }
+  };
+  const runner = createRunner({
+    script: { initialDelayMs: 0, defaultMessageIntervalMs: 40000, paragraphIntervalMs: 720000, paragraphs: [{ id: '01', messages: ['one', 'two'] }] },
+    client,
+    sleep: async () => {}
+  });
+  const running = runner.run();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sendCount, 1);
+
+  runner.stop({ abortInFlight: false });
+  assert.equal(runner.activeController.signal.aborted, false);
+
+  resolveSend();
+  await running;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sendCount, 1);
+});
+
+test('stop() 默认中止在途请求并结束轮询', async () => {
+  let capturedSignal;
+  let sendCount = 0;
+  const client = {
+    sendMessage: ({ signal }) => {
+      sendCount += 1;
+      capturedSignal = signal;
+      return new Promise((resolve) => {
+        signal.addEventListener('abort', () => resolve({ ok: false, cancelled: true }), { once: true });
+      });
+    }
+  };
+  const runner = createRunner({
+    script: { initialDelayMs: 0, defaultMessageIntervalMs: 40000, paragraphIntervalMs: 720000, paragraphs: [{ id: '01', messages: ['one', 'two'] }] },
+    client,
+    sleep: async () => {}
+  });
+  const running = runner.run();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sendCount, 1);
+
+  runner.stop();
+  assert.equal(capturedSignal.aborted, true);
+  await running;
+  assert.equal(sendCount, 1);
 });
 
 test('graceful shutdown 停止空内容 Runner 并释放实际监听端口', async () => {
@@ -272,11 +686,33 @@ test('graceful shutdown 停止空内容 Runner 并释放实际监听端口', asy
   const port = probe.address().port;
   await new Promise((resolve) => probe.close(resolve));
   const running = await start({ logger: loggerCapture(), loadConfigFn: () => createTestConfig(port), scriptDefinition: EMPTY_SCRIPT });
+  await running.controller.start();
   const processRef = new EventEmitter();
   const handlers = installShutdownHandlers({ running, logger: loggerCapture(), processRef });
   processRef.emit('SIGTERM');
   await handlers.shutdown('SIGTERM');
-  assert.equal(running.runner.stopped, true);
+  assert.equal(running.controller.getStatus().state, 'stopped');
+  const rebound = await bindPort(port);
+  await new Promise((resolve) => rebound.close(resolve));
+});
+
+test('未开启轮询时收到 SIGTERM 仍释放监听端口', async () => {
+  const probe = await bindPort(0);
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const running = await start({
+    logger: loggerCapture(),
+    loadConfigFn: () => createTestConfig(port),
+    createRuisiClientFn: () => ({}),
+    createPollingRunnerFn: () => createControllableRunner()
+  });
+  const processRef = new EventEmitter();
+  const shutdownHandlers = installShutdownHandlers({ running, logger: loggerCapture(), processRef });
+
+  processRef.emit('SIGTERM');
+  await shutdownHandlers.shutdown('SIGTERM');
+
   const rebound = await bindPort(port);
   await new Promise((resolve) => rebound.close(resolve));
 });
