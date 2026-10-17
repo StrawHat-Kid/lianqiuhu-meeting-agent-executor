@@ -25,6 +25,7 @@ npm start
 | `INGRESS_PORT` | RUISI ingress 端口。 |
 | `INGRESS_TOKEN` | RUISI ingress 的 `X-Auth-Token`，不得提交真实值。 |
 | `INGRESS_TIMEOUT_MS` | 可选请求超时，默认 `5000` 毫秒。 |
+| `POLLING_MAX_DURATION_HOURS` | 可选轮询最长运行时长（小时），默认 `10`；可通过部署环境变量或 `.env` 修改，取值必须为大于 0 的有限数值且换算为毫秒后不超过 `2147483647`（约 `596.52` 小时），非法或超限值在启动时明确报错。 |
 
 回程请求固定为 `POST http://${INGRESS_HOST}:${INGRESS_PORT}/agent/send`，请求体的 `to` 为 `xslatdzp.demo001@rscom-chat.rsagent.net`，并携带 `X-Auth-Token`。HTTP 任意 2xx 均视为成功；单条失败会记录日志，后续消息和轮询继续执行。
 
@@ -57,6 +58,7 @@ curl -X POST http://127.0.0.1:18035/api/commands \
 - 未知 action、非法 JSON、空数组、仅含 action 的单个对象、`params` 非对象等返回 `400 {"ok":false,"error":"..."}`；`/api/commands` 使用非 POST 方法返回 `405`；其他路径返回 `404 {"status":"not_found"}`。
 - 空脚本（无轮询内容）时，启动指令进入空闲保持、不会发送任何消息；取消指令可正常停止。
 - 停止后再次发送启动指令会创建新的轮询任务，并从段落 01 第 1 条重新开始；`SIGINT`/`SIGTERM` 仍会中止在途请求并退出进程。
+- 轮询从首次启动开始按 `POLLING_MAX_DURATION_HOURS` 计时，重复启动不会重置或延长该计时；到期后自动停止轮询（等待在途请求完成，语义与取消指令一致），HTTP 服务不退出，之后的启动指令会重新开始一轮完整计时。手动取消会清理该定时器。
 - 原 `/api/polling/start`、`/api/polling/stop`、`/api/polling/status` 路由已移除，不再对外提供。
 - 健康检查：`GET /health` 返回 HTTP `200` 与 `{"status":"ok"}`，停止轮询后仍然可用。
 
