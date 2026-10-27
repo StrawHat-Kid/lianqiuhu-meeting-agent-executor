@@ -2,7 +2,7 @@ const http = require('node:http');
 const { EventEmitter } = require('node:events');
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { loadConfig, readConfig } = require('../src/config');
+const { loadConfig, readHallConfig } = require('../src/config');
 const { createLogger, formatBeijingTimestamp } = require('../src/logger');
 const { createRuisiClient } = require('../src/ruisi-client');
 const { PollingRunner } = require('../src/polling-runner');
@@ -11,6 +11,24 @@ const script = require('../src/scripts/messages');
 const { TO, start, installShutdownHandlers } = require('../src');
 
 const TEST_AGENT = 'test-meeting-agent';
+const TEST_AGENT_B = 'test-meeting-agent-b';
+const TEST_TOKEN_A = 'test-token-a-0123456789abcdef';
+const TEST_TOKEN_B = 'test-token-b-0123456789abcdef';
+const HALL_A = 'exhibition-a';
+const HALL_B = 'exhibition-b';
+
+function legacySingleHallEnv(overrides = {}) {
+  return {
+    PORT: '18031',
+    HC_TOKEN_MAP: `${TEST_TOKEN_A}:${HALL_A}`,
+    AGENT: TEST_AGENT,
+    INGRESS_HOST: '127.0.0.1',
+    INGRESS_PORT: '29876',
+    INGRESS_TOKEN: 'test',
+    ...overrides
+  };
+}
+
 const TEST_SCRIPT = Object.freeze({
   initialDelayMs: 0,
   defaultMessageIntervalMs: 40000,
@@ -75,17 +93,37 @@ function readJson(request) {
   });
 }
 
+function createTestHalls() {
+  return new Map([
+    [HALL_A, {
+      hallId: HALL_A,
+      agent: TEST_AGENT,
+      ingressHost: '127.0.0.1',
+      ingressPort: 29876,
+      ingressToken: 'test-token',
+      to: TO,
+      ingressUrl: 'http://127.0.0.1:29876/agent/send'
+    }],
+    [HALL_B, {
+      hallId: HALL_B,
+      agent: TEST_AGENT_B,
+      ingressHost: '127.0.0.1',
+      ingressPort: 29877,
+      ingressToken: 'test-token-b',
+      to: TO,
+      ingressUrl: 'http://127.0.0.1:29877/agent/send'
+    }]
+  ]);
+}
+
 function createTestConfig(port, overrides = {}) {
   return {
-    agent: TEST_AGENT,
     port,
-    ingressHost: '127.0.0.1',
-    ingressPort: 29876,
-    ingressToken: 'test-token',
     ingressTimeoutMs: 1000,
     pollingMaxDurationHours: 10,
     pollingMaxDurationMs: 36000000,
-    ingressUrl: 'http://127.0.0.1:29876/agent/send',
+    tokenMap: new Map([[TEST_TOKEN_A, HALL_A], [TEST_TOKEN_B, HALL_B]]),
+    halls: createTestHalls(),
     ...overrides
   };
 }
@@ -118,10 +156,11 @@ async function requestHealth(port) {
   });
 }
 
-async function requestJson(port, method, path, payload) {
+async function requestJson(port, method, path, payload, token = TEST_TOKEN_A) {
   const body = payload === undefined ? null : JSON.stringify(payload);
   return new Promise((resolve, reject) => {
     const headers = body === null ? {} : { 'Content-Type': 'application/json' };
+    if (token !== null) headers['X-HC-Token'] = token;
     const request = http.request({ host: '127.0.0.1', port, method, path, headers }, (response) => {
       response.setEncoding('utf8');
       let responseBody = '';
@@ -134,9 +173,11 @@ async function requestJson(port, method, path, payload) {
   });
 }
 
-async function requestRaw(port, method, path, text) {
+async function requestRaw(port, method, path, text, token = TEST_TOKEN_A) {
   return new Promise((resolve, reject) => {
-    const request = http.request({ host: '127.0.0.1', port, method, path, headers: { 'Content-Type': 'application/json' } }, (response) => {
+    const headers = { 'Content-Type': 'application/json' };
+    if (token !== null) headers['X-HC-Token'] = token;
+    const request = http.request({ host: '127.0.0.1', port, method, path, headers }, (response) => {
       response.setEncoding('utf8');
       let responseBody = '';
       response.on('data', (chunk) => { responseBody += chunk; });
@@ -178,25 +219,24 @@ function createControllableRunner() {
   return runner;
 }
 
-test('配置读取 PORT=18035，AGENT 缺失时 HTTP Server 和 Runner 均不启动', async () => {
-  const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
-  assert.deepEqual(readConfig(baseEnv), {
-    agent: TEST_AGENT, port: 18035, ingressHost: '127.0.0.1', ingressPort: 29876,
-    ingressToken: 'test', ingressTimeoutMs: 5000, pollingMaxDurationHours: 10,
-    pollingMaxDurationMs: 36000000, ingressUrl: 'http://127.0.0.1:29876/agent/send'
-  });
-  assert.equal(readConfig({ ...baseEnv, PORT: '18035' }).port, 18035);
-  assert.throws(() => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' }), /AGENT/);
-  assert.throws(() => readConfig({ ...baseEnv, PORT: 'invalid' }), /PORT/);
+test('配置读取成功且展厅配置缺失时 HTTP Server 和 Runner 均不启动', async () => {
+  const baseEnv = legacySingleHallEnv();
+  const config = readHallConfig(baseEnv);
+  const hall = config.halls.get(HALL_A);
+  assert.equal(hall.agent, TEST_AGENT);
+  assert.equal(hall.ingressUrl, 'http://127.0.0.1:29876/agent/send');
+  assert.equal(config.pollingMaxDurationMs, 36000000);
+  assert.throws(() => readHallConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' }), /HC_TOKEN_MAP/);
+  assert.throws(() => readHallConfig({ ...baseEnv, PORT: 'invalid' }), /PORT/);
   let healthServerCreated = false;
   let runnerCreated = false;
   await assert.rejects(
     start({
-      loadConfigFn: () => readConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' }),
+      loadConfigFn: () => readHallConfig({ INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' }),
       createHealthServerFn: () => { healthServerCreated = true; },
       createPollingRunnerFn: () => { runnerCreated = true; }
     }),
-    /AGENT/
+    /HC_TOKEN_MAP/
   );
   assert.equal(healthServerCreated, false);
   assert.equal(runnerCreated, false);
@@ -255,7 +295,7 @@ test('process.env AGENT、ingress、to 沿完整配置链进入 /agent/send 请�
     requests.push({ method: request.method, headers: request.headers, body: await readJson(request) });
     response.writeHead(200, { 'Content-Type': 'application/json' }).end('{"status":"ok"}');
   });
-  const envKeys = ['AGENT', 'PORT', 'INGRESS_HOST', 'INGRESS_PORT', 'INGRESS_TOKEN', 'INGRESS_TIMEOUT_MS'];
+  const envKeys = ['AGENT', 'PORT', 'INGRESS_HOST', 'INGRESS_PORT', 'INGRESS_TOKEN', 'INGRESS_TIMEOUT_MS', 'HC_TOKEN_MAP'];
   const savedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   try {
     const ingressUrl = new URL(ingress.url);
@@ -265,13 +305,16 @@ test('process.env AGENT、ingress、to 沿完整配置链进入 /agent/send 请�
       INGRESS_HOST: ingressUrl.hostname,
       INGRESS_PORT: ingressUrl.port,
       INGRESS_TOKEN: 'test-token',
-      INGRESS_TIMEOUT_MS: '1000'
+      INGRESS_TIMEOUT_MS: '1000',
+      HC_TOKEN_MAP: `${TEST_TOKEN_A}:${HALL_A}`
     });
     const config = loadConfig();
-    assert.equal(config.agent, TEST_AGENT);
-    assert.equal(config.ingressUrl, ingress.url);
-    const client = createRuisiClient({ ...config, authToken: config.ingressToken, timeoutMs: config.ingressTimeoutMs });
-    await createRunner({ agent: config.agent, client, sleep: fakeSleep([]) }).run({ maxRounds: 1 });
+    const hall = config.halls.get(HALL_A);
+    assert.equal(config.halls.size, 1);
+    assert.equal(hall.agent, TEST_AGENT);
+    assert.equal(hall.ingressUrl, ingress.url);
+    const client = createRuisiClient({ ingressUrl: hall.ingressUrl, authToken: hall.ingressToken, timeoutMs: config.ingressTimeoutMs });
+    await createRunner({ agent: hall.agent, client, sleep: fakeSleep([]) }).run({ maxRounds: 1 });
     assert.deepEqual(requests.map(({ body }) => body), [
       { agent: TEST_AGENT, to: TO, body: 'segment A-1', groupchat: false },
       { agent: TEST_AGENT, to: TO, body: 'segment A-2', groupchat: false },
@@ -310,7 +353,7 @@ test('HTTP 服务实际监听配置 PORT=18035，GET /health 返回 200，且 AG
   const probe = await bindPort(port);
   await new Promise((resolve) => probe.close(resolve));
   let runnerOptions;
-  let clientOptions;
+  const clientOptions = [];
   let resolveRun;
   const runner = {
     run: () => new Promise((resolve) => { resolveRun = resolve; }),
@@ -319,19 +362,22 @@ test('HTTP 服务实际监听配置 PORT=18035，GET /health 返回 200，且 AG
   const running = await start({
     logger: loggerCapture(),
     loadConfigFn: () => createTestConfig(port),
-    createRuisiClientFn: (options) => { clientOptions = options; return {}; },
+    createRuisiClientFn: (options) => { clientOptions.push(options); return {}; },
     createPollingRunnerFn: (options) => { runnerOptions = options; return runner; }
   });
   try {
     assert.equal(running.server.address().port, port);
-    assert.equal(running.config.agent, TEST_AGENT);
+    assert.equal(running.controllers.size, 2);
     assert.equal(runnerOptions, undefined);
     assert.deepEqual(
-      { ingressHost: clientOptions.ingressHost, ingressPort: clientOptions.ingressPort, authToken: clientOptions.authToken, timeoutMs: clientOptions.timeoutMs, ingressUrl: clientOptions.ingressUrl },
-      { ingressHost: '127.0.0.1', ingressPort: 29876, authToken: 'test-token', timeoutMs: 1000, ingressUrl: 'http://127.0.0.1:29876/agent/send' }
+      clientOptions.map((options) => ({ authToken: options.authToken, timeoutMs: options.timeoutMs, ingressUrl: options.ingressUrl })),
+      [
+        { authToken: 'test-token', timeoutMs: 1000, ingressUrl: 'http://127.0.0.1:29876/agent/send' },
+        { authToken: 'test-token-b', timeoutMs: 1000, ingressUrl: 'http://127.0.0.1:29877/agent/send' }
+      ]
     );
     assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
-    await running.controller.start();
+    await running.controllers.get(HALL_A).start();
     assert.equal(runnerOptions.agent, TEST_AGENT);
     assert.equal(runnerOptions.to, TO);
   } finally {
@@ -696,12 +742,12 @@ test('graceful shutdown 停止空内容 Runner 并释放实际监听端口', asy
   const port = probe.address().port;
   await new Promise((resolve) => probe.close(resolve));
   const running = await start({ logger: loggerCapture(), loadConfigFn: () => createTestConfig(port), scriptDefinition: EMPTY_SCRIPT });
-  await running.controller.start();
+  await running.controllers.get(HALL_A).start();
   const processRef = new EventEmitter();
   const handlers = installShutdownHandlers({ running, logger: loggerCapture(), processRef });
   processRef.emit('SIGTERM');
   await handlers.shutdown('SIGTERM');
-  assert.equal(running.controller.getStatus().state, 'stopped');
+  assert.equal(running.controllers.get(HALL_A).getStatus().state, 'stopped');
   const rebound = await bindPort(port);
   await new Promise((resolve) => rebound.close(resolve));
 });
@@ -764,32 +810,32 @@ test('日志使用北京时间且 token 脱敏', () => {
 });
 
 test('配置项 POLLING_MAX_DURATION_HOURS 默认 10 小时，合法值生效，非法值启动时明确报错', () => {
-  const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
-  assert.equal(readConfig(baseEnv).pollingMaxDurationHours, 10);
-  assert.equal(readConfig(baseEnv).pollingMaxDurationMs, 36000000);
-  assert.equal(readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '' }).pollingMaxDurationHours, 10);
-  const custom = readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '0.5' });
+  const baseEnv = legacySingleHallEnv();
+  assert.equal(readHallConfig(baseEnv).pollingMaxDurationHours, 10);
+  assert.equal(readHallConfig(baseEnv).pollingMaxDurationMs, 36000000);
+  assert.equal(readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '' }).pollingMaxDurationHours, 10);
+  const custom = readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '0.5' });
   assert.equal(custom.pollingMaxDurationHours, 0.5);
   assert.equal(custom.pollingMaxDurationMs, 1800000);
-  assert.equal(readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '2' }).pollingMaxDurationMs, 7200000);
+  assert.equal(readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '2' }).pollingMaxDurationMs, 7200000);
   for (const invalid of ['0', '-1', 'abc', 'Infinity', 'NaN', '1e999']) {
-    assert.throws(() => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: invalid }), /POLLING_MAX_DURATION_HOURS/);
+    assert.throws(() => readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: invalid }), /POLLING_MAX_DURATION_HOURS/);
   }
 });
 
 test('配置项 POLLING_MAX_DURATION_HOURS 拒绝定时器溢出值和舍入为零的值', () => {
-  const baseEnv = { AGENT: TEST_AGENT, INGRESS_HOST: '127.0.0.1', INGRESS_PORT: '29876', INGRESS_TOKEN: 'test' };
-  assert.equal(readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '596.52' }).pollingMaxDurationMs, 2147472000);
+  const baseEnv = legacySingleHallEnv();
+  assert.equal(readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '596.52' }).pollingMaxDurationMs, 2147472000);
   assert.throws(
-    () => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '596.53' }),
+    () => readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '596.53' }),
     /POLLING_MAX_DURATION_HOURS is out of supported range.*2147483647/
   );
   assert.throws(
-    () => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '1000' }),
+    () => readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '1000' }),
     /POLLING_MAX_DURATION_HOURS is out of supported range.*2147483647/
   );
   assert.throws(
-    () => readConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '0.0000001' }),
+    () => readHallConfig({ ...baseEnv, POLLING_MAX_DURATION_HOURS: '0.0000001' }),
     /POLLING_MAX_DURATION_HOURS is out of supported range/
   );
 });
@@ -1001,7 +1047,7 @@ test('HTTP 启动指令开始计时，自动停止后服务仍可用且可再次
     t.mock.timers.tick(2000);
     await drainTasks();
     assert.equal(runners[0].stopped, 1);
-    assert.equal(running.controller.getStatus().state, 'stopped');
+    assert.equal(running.controllers.get(HALL_A).getStatus().state, 'stopped');
 
     assert.deepEqual(await requestHealth(port), { statusCode: 200, body: JSON.stringify({ status: 'ok' }) });
 
@@ -1010,7 +1056,7 @@ test('HTTP 启动指令开始计时，自动停止后服务仍可用且可再次
       body: { ok: true, message: 'polling started' }
     });
     assert.equal(runners.length, 2);
-    assert.equal(running.controller.getStatus().state, 'running');
+    assert.equal(running.controllers.get(HALL_A).getStatus().state, 'running');
 
     t.mock.timers.tick(2000);
     await drainTasks();
